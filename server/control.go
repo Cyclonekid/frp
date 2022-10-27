@@ -23,62 +23,62 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fatedier/frp/models/auth"
-	"github.com/fatedier/frp/models/config"
-	"github.com/fatedier/frp/models/consts"
-	frpErr "github.com/fatedier/frp/models/errors"
-	"github.com/fatedier/frp/models/msg"
-	plugin "github.com/fatedier/frp/models/plugin/server"
-	"github.com/fatedier/frp/server/controller"
-	"github.com/fatedier/frp/server/metrics"
-	"github.com/fatedier/frp/server/proxy"
-	"github.com/fatedier/frp/utils/util"
-	"github.com/fatedier/frp/utils/version"
-	"github.com/fatedier/frp/utils/xlog"
-
 	"github.com/fatedier/golib/control/shutdown"
 	"github.com/fatedier/golib/crypto"
 	"github.com/fatedier/golib/errors"
+
+	"github.com/fatedier/frp/pkg/auth"
+	"github.com/fatedier/frp/pkg/config"
+	"github.com/fatedier/frp/pkg/consts"
+	frpErr "github.com/fatedier/frp/pkg/errors"
+	"github.com/fatedier/frp/pkg/msg"
+	plugin "github.com/fatedier/frp/pkg/plugin/server"
+	"github.com/fatedier/frp/pkg/util/util"
+	"github.com/fatedier/frp/pkg/util/version"
+	"github.com/fatedier/frp/pkg/util/xlog"
+	"github.com/fatedier/frp/server/controller"
+	"github.com/fatedier/frp/server/metrics"
+	"github.com/fatedier/frp/server/proxy"
 )
 
 type ControlManager struct {
 	// controls indexed by run id
-	ctlsByRunId map[string]*Control
+	ctlsByRunID map[string]*Control
 
 	mu sync.RWMutex
 }
 
 func NewControlManager() *ControlManager {
 	return &ControlManager{
-		ctlsByRunId: make(map[string]*Control),
+		ctlsByRunID: make(map[string]*Control),
 	}
 }
 
-func (cm *ControlManager) Add(runId string, ctl *Control) (oldCtl *Control) {
+func (cm *ControlManager) Add(runID string, ctl *Control) (oldCtl *Control) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	oldCtl, ok := cm.ctlsByRunId[runId]
+	oldCtl, ok := cm.ctlsByRunID[runID]
 	if ok {
 		oldCtl.Replaced(ctl)
 	}
-	cm.ctlsByRunId[runId] = ctl
+	cm.ctlsByRunID[runID] = ctl
 	return
 }
 
 // we should make sure if it's the same control to prevent delete a new one
-func (cm *ControlManager) Del(runId string, ctl *Control) {
+func (cm *ControlManager) Del(runID string, ctl *Control) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	if c, ok := cm.ctlsByRunId[runId]; ok && c == ctl {
-		delete(cm.ctlsByRunId, runId)
+	if c, ok := cm.ctlsByRunID[runID]; ok && c == ctl {
+		delete(cm.ctlsByRunID, runID)
 	}
 }
 
-func (cm *ControlManager) GetById(runId string) (ctl *Control, ok bool) {
+func (cm *ControlManager) GetByID(runID string) (ctl *Control, ok bool) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-	ctl, ok = cm.ctlsByRunId[runId]
+	ctl, ok = cm.ctlsByRunID[runID]
 	return
 }
 
@@ -87,7 +87,7 @@ type Control struct {
 	rc *controller.ResourceController
 
 	// proxy manager
-	pxyManager *proxy.ProxyManager
+	pxyManager *proxy.Manager
 
 	// plugin manager
 	pluginManager *plugin.Manager
@@ -125,7 +125,7 @@ type Control struct {
 	// A new run id will be generated when a new client login.
 	// If run id got from login message has same run id, it means it's the same client, so we can
 	// replace old controller instantly.
-	runId string
+	runID string
 
 	// control status
 	status string
@@ -147,14 +147,13 @@ type Control struct {
 func NewControl(
 	ctx context.Context,
 	rc *controller.ResourceController,
-	pxyManager *proxy.ProxyManager,
+	pxyManager *proxy.Manager,
 	pluginManager *plugin.Manager,
 	authVerifier auth.Verifier,
 	ctlConn net.Conn,
 	loginMsg *msg.Login,
 	serverCfg config.ServerCommonConf,
 ) *Control {
-
 	poolCount := loginMsg.PoolCount
 	if poolCount > int(serverCfg.MaxPoolCount) {
 		poolCount = int(serverCfg.MaxPoolCount)
@@ -173,7 +172,7 @@ func NewControl(
 		poolCount:       poolCount,
 		portsUsedNum:    0,
 		lastPing:        time.Now(),
-		runId:           loginMsg.RunId,
+		runID:           loginMsg.RunID,
 		status:          consts.Working,
 		readerShutdown:  shutdown.New(),
 		writerShutdown:  shutdown.New(),
@@ -189,11 +188,11 @@ func NewControl(
 func (ctl *Control) Start() {
 	loginRespMsg := &msg.LoginResp{
 		Version:       version.Full(),
-		RunId:         ctl.runId,
-		ServerUdpPort: ctl.serverCfg.BindUdpPort,
+		RunID:         ctl.runID,
+		ServerUDPPort: ctl.serverCfg.BindUDPPort,
 		Error:         "",
 	}
-	msg.WriteMsg(ctl.conn, loginRespMsg)
+	_ = msg.WriteMsg(ctl.conn, loginRespMsg)
 
 	go ctl.writer()
 	for i := 0; i < ctl.poolCount; i++ {
@@ -248,19 +247,17 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 		xl.Debug("get work connection from pool")
 	default:
 		// no work connections available in the poll, send message to frpc to get more
-		err = errors.PanicToError(func() {
+		if err = errors.PanicToError(func() {
 			ctl.sendCh <- &msg.ReqWorkConn{}
-		})
-		if err != nil {
-			xl.Error("%v", err)
-			return
+		}); err != nil {
+			return nil, fmt.Errorf("control is already closed")
 		}
 
 		select {
 		case workConn, ok = <-ctl.workConnCh:
 			if !ok {
 				err = frpErr.ErrCtlClosed
-				xl.Warn("no work connections avaiable, %v", err)
+				xl.Warn("no work connections available, %v", err)
 				return
 			}
 
@@ -272,7 +269,7 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 	}
 
 	// When we get a work connection from pool, replace it with a new one.
-	errors.PanicToError(func() {
+	_ = errors.PanicToError(func() {
 		ctl.sendCh <- &msg.ReqWorkConn{}
 	})
 	return
@@ -280,8 +277,8 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 
 func (ctl *Control) Replaced(newCtl *Control) {
 	xl := ctl.xl
-	xl.Info("Replaced by client [%s]", newCtl.runId)
-	ctl.runId = ""
+	xl.Info("Replaced by client [%s]", newCtl.runID)
+	ctl.runID = ""
 	ctl.allShutdown.Start()
 }
 
@@ -304,14 +301,15 @@ func (ctl *Control) writer() {
 		return
 	}
 	for {
-		if m, ok := <-ctl.sendCh; !ok {
+		m, ok := <-ctl.sendCh
+		if !ok {
 			xl.Info("control writer is closing")
 			return
-		} else {
-			if err := msg.WriteMsg(encWriter, m); err != nil {
-				xl.Warn("write message to control connection error: %v", err)
-				return
-			}
+		}
+
+		if err := msg.WriteMsg(encWriter, m); err != nil {
+			xl.Warn("write message to control connection error: %v", err)
+			return
 		}
 	}
 }
@@ -330,18 +328,18 @@ func (ctl *Control) reader() {
 
 	encReader := crypto.NewReader(ctl.conn, []byte(ctl.serverCfg.Token))
 	for {
-		if m, err := msg.ReadMsg(encReader); err != nil {
+		m, err := msg.ReadMsg(encReader)
+		if err != nil {
 			if err == io.EOF {
 				xl.Debug("control connection closed")
 				return
-			} else {
-				xl.Warn("read error: %v", err)
-				ctl.conn.Close()
-				return
 			}
-		} else {
-			ctl.readCh <- m
+			xl.Warn("read error: %v", err)
+			ctl.conn.Close()
+			return
 		}
+
+		ctl.readCh <- m
 	}
 }
 
@@ -356,14 +354,14 @@ func (ctl *Control) stoper() {
 
 	ctl.allShutdown.WaitStart()
 
+	ctl.conn.Close()
+	ctl.readerShutdown.WaitDone()
+
 	close(ctl.readCh)
 	ctl.managerShutdown.WaitDone()
 
 	close(ctl.sendCh)
 	ctl.writerShutdown.WaitDone()
-
-	ctl.conn.Close()
-	ctl.readerShutdown.WaitDone()
 
 	ctl.mu.Lock()
 	defer ctl.mu.Unlock()
@@ -377,6 +375,20 @@ func (ctl *Control) stoper() {
 		pxy.Close()
 		ctl.pxyManager.Del(pxy.GetName())
 		metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConf().GetBaseInfo().ProxyType)
+
+		notifyContent := &plugin.CloseProxyContent{
+			User: plugin.UserInfo{
+				User:  ctl.loginMsg.User,
+				Metas: ctl.loginMsg.Metas,
+				RunID: ctl.loginMsg.RunID,
+			},
+			CloseProxy: msg.CloseProxy{
+				ProxyName: pxy.GetName(),
+			},
+		}
+		go func() {
+			_ = ctl.pluginManager.CloseProxy(notifyContent)
+		}()
 	}
 
 	ctl.allShutdown.Done()
@@ -401,13 +413,20 @@ func (ctl *Control) manager() {
 	defer ctl.allShutdown.Start()
 	defer ctl.managerShutdown.Done()
 
-	heartbeat := time.NewTicker(time.Second)
-	defer heartbeat.Stop()
+	var heartbeatCh <-chan time.Time
+	if ctl.serverCfg.TCPMux || ctl.serverCfg.HeartbeatTimeout <= 0 {
+		// Don't need application heartbeat here.
+		// yamux will do same thing.
+	} else {
+		heartbeat := time.NewTicker(time.Second)
+		defer heartbeat.Stop()
+		heartbeatCh = heartbeat.C
+	}
 
 	for {
 		select {
-		case <-heartbeat.C:
-			if time.Since(ctl.lastPing) > time.Duration(ctl.serverCfg.HeartBeatTimeout)*time.Second {
+		case <-heartbeatCh:
+			if time.Since(ctl.lastPing) > time.Duration(ctl.serverCfg.HeartbeatTimeout)*time.Second {
 				xl.Warn("heartbeat timeout")
 				return
 			}
@@ -422,6 +441,7 @@ func (ctl *Control) manager() {
 					User: plugin.UserInfo{
 						User:  ctl.loginMsg.User,
 						Metas: ctl.loginMsg.Metas,
+						RunID: ctl.loginMsg.RunID,
 					},
 					NewProxy: *m,
 				}
@@ -437,22 +457,35 @@ func (ctl *Control) manager() {
 					ProxyName: m.ProxyName,
 				}
 				if err != nil {
-					xl.Warn("new proxy [%s] error: %v", m.ProxyName, err)
+					xl.Warn("new proxy [%s] type [%s] error: %v", m.ProxyName, m.ProxyType, err)
 					resp.Error = util.GenerateResponseErrorString(fmt.Sprintf("new proxy [%s] error", m.ProxyName), err, ctl.serverCfg.DetailedErrorsToClient)
 				} else {
 					resp.RemoteAddr = remoteAddr
-					xl.Info("new proxy [%s] success", m.ProxyName)
+					xl.Info("new proxy [%s] type [%s] success", m.ProxyName, m.ProxyType)
 					metrics.Server.NewProxy(m.ProxyName, m.ProxyType)
 				}
 				ctl.sendCh <- resp
 			case *msg.CloseProxy:
-				ctl.CloseProxy(m)
+				_ = ctl.CloseProxy(m)
 				xl.Info("close proxy [%s] success", m.ProxyName)
 			case *msg.Ping:
-				if err := ctl.authVerifier.VerifyPing(m); err != nil {
+				content := &plugin.PingContent{
+					User: plugin.UserInfo{
+						User:  ctl.loginMsg.User,
+						Metas: ctl.loginMsg.Metas,
+						RunID: ctl.loginMsg.RunID,
+					},
+					Ping: *m,
+				}
+				retContent, err := ctl.pluginManager.Ping(content)
+				if err == nil {
+					m = &retContent.Ping
+					err = ctl.authVerifier.VerifyPing(m)
+				}
+				if err != nil {
 					xl.Warn("received invalid ping: %v", err)
 					ctl.sendCh <- &msg.Pong{
-						Error: "invalid authentication in ping",
+						Error: util.GenerateResponseErrorString("invalid ping", err, ctl.serverCfg.DetailedErrorsToClient),
 					}
 					return
 				}
@@ -472,9 +505,16 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err 
 		return
 	}
 
+	// User info
+	userInfo := plugin.UserInfo{
+		User:  ctl.loginMsg.User,
+		Metas: ctl.loginMsg.Metas,
+		RunID: ctl.runID,
+	}
+
 	// NewProxy will return a interface Proxy.
 	// In fact it create different proxies by different proxy type, we just call run() here.
-	pxy, err := proxy.NewProxy(ctl.ctx, ctl.runId, ctl.rc, ctl.poolCount, ctl.GetWorkConn, pxyConf, ctl.serverCfg)
+	pxy, err := proxy.NewProxy(ctl.ctx, userInfo, ctl.rc, ctl.poolCount, ctl.GetWorkConn, pxyConf, ctl.serverCfg)
 	if err != nil {
 		return remoteAddr, err
 	}
@@ -487,13 +527,13 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err 
 			err = fmt.Errorf("exceed the max_ports_per_client")
 			return
 		}
-		ctl.portsUsedNum = ctl.portsUsedNum + pxy.GetUsedPortsNum()
+		ctl.portsUsedNum += pxy.GetUsedPortsNum()
 		ctl.mu.Unlock()
 
 		defer func() {
 			if err != nil {
 				ctl.mu.Lock()
-				ctl.portsUsedNum = ctl.portsUsedNum - pxy.GetUsedPortsNum()
+				ctl.portsUsedNum -= pxy.GetUsedPortsNum()
 				ctl.mu.Unlock()
 			}
 		}()
@@ -529,7 +569,7 @@ func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
 	}
 
 	if ctl.serverCfg.MaxPortsPerClient > 0 {
-		ctl.portsUsedNum = ctl.portsUsedNum - pxy.GetUsedPortsNum()
+		ctl.portsUsedNum -= pxy.GetUsedPortsNum()
 	}
 	pxy.Close()
 	ctl.pxyManager.Del(pxy.GetName())
@@ -537,5 +577,20 @@ func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
 	ctl.mu.Unlock()
 
 	metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConf().GetBaseInfo().ProxyType)
+
+	notifyContent := &plugin.CloseProxyContent{
+		User: plugin.UserInfo{
+			User:  ctl.loginMsg.User,
+			Metas: ctl.loginMsg.Metas,
+			RunID: ctl.loginMsg.RunID,
+		},
+		CloseProxy: msg.CloseProxy{
+			ProxyName: pxy.GetName(),
+		},
+	}
+	go func() {
+		_ = ctl.pluginManager.CloseProxy(notifyContent)
+	}()
+
 	return
 }
