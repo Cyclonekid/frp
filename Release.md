@@ -1,3 +1,6 @@
-### Improve
+### Fixes
 
-* Adjust http group load balancing to forward requests to each frpc proxy round robin. Previous behavior is always forwarding requests to single proxy in the case of single concurrency.
+* `transport.tls.disableCustomTLSFirstByte` doesn't have any effect.
+* The Server API did not return the data correctly.
+* The Dashboard is unable to display data.
+* `natHoleStunServer` is missing a default value.
